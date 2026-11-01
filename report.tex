@@ -1,0 +1,384 @@
+% report.tex — technical report of the open repository
+% Compile: pdflatex report.tex  (twice, for hyperref anchors)
+% Verified with TeX Live pdflatex (no CJK dependency; README.md is the Chinese companion).
+\documentclass[11pt]{article}
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage[hidelinks]{hyperref}
+\usepackage{microtype}
+
+\newcommand{\pq}{\mathrm{PQ}}
+\newcommand{\IoU}{\mathrm{IoU}}
+
+\title{Consensus Pseudo-Labels and a High-Resolution U-Net for\\
+Solar Filament Instance Segmentation\\
+\large Technical report of the open repository\\
+(IEEE BigData Cup 2026 --- Kaggle \texttt{filament-segmentation-2026})}
+\author{Repository engineering snapshot of the original competition pipeline}
+\date{2026-11-01}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This repository documents, without any competition data, a complete and
+reproducible pipeline for the IEEE BigData Cup 2026 solar filament
+segmentation task: multi-annotator polygon annotations are turned into
+per-pixel \emph{consensus pseudo-labels} by pixel-level voting; a U-Net
+(base\,32, depth\,5, 7{,}759{,}653 parameters) trained on $1024^2$ crops
+predicts a filament probability map; instances are recovered by thresholding,
+optional morphological closing, 4-connected components, an area floor and a
+graded fallback that guarantees at least one instance per image; the final
+submission averages probabilities of four independently trained seeds with
+horizontal-flip test-time augmentation. On the project's frozen validation
+set (88 images, 220 annotator--image rows, official pooled Panoptic Quality)
+the 1024$^2$ line reaches $\pq=0.3279$ versus $0.2201$ for the
+hand-crafted detector it replaced. Because test images carry no public
+labels, the best-scoring submissions were never scored online; the only
+public-leaderboard numbers in this report come from the earlier
+hand-crafted line (0.15--0.18). Every number below is traceable to a file
+or a command; Section~\ref{sec:repro} lists the checks re-executed while
+building this repository, including bit-exact reproductions of the
+post-processing sweep on frozen probability caches.
+\end{abstract}
+
+\section{Task and official metric}
+\label{sec:task}
+
+The task is instance segmentation of solar filaments in $2048\times2048$
+grayscale H$\alpha$ images. Training annotations are public; the 180 test
+images have \emph{no} public labels, and submissions are scored by the
+organizers. The official metric is Panoptic Quality
+\cite{kirillov2019}, as defined by the organizer's public self-evaluation
+notebook \cite{notebook} and replicated line-by-line in this repository's
+\texttt{solar\_pq.py}:
+
+\begin{itemize}
+\item a \emph{row} is an (annotator, image) pair; ground truth is grouped
+      per row, while predictions are shared by all annotator rows of the
+      same image;
+\item a prediction hits a ground-truth instance iff $\IoU > 0.5$
+      (\emph{strictly} greater; $0.5$ itself is not a hit);
+\item true positives are counted as \emph{pairs} with no one-to-one
+      matching: one prediction may hit several ground-truth instances and
+      vice versa; the numerator accumulates the $\IoU$ of each hit pair;
+\item $\mathrm{FP}$ = predictions of the row that hit nothing;
+      $\mathrm{FN}$ = ground-truth instances hit by nothing;
+\item the official (pooled) score is
+      \[
+        \pq \;=\; \frac{\sum_{\text{hit pairs}} \IoU}
+             {|\mathrm{TP}| + 0.5\,|\mathrm{FP}| + 0.5\,|\mathrm{FN}|}\,,
+      \]
+      with all rows pooled into one numerator/denominator.
+\end{itemize}
+
+Two consequences drive the whole design. First, a prediction that
+simultaneously matches several annotators' filaments of the same image
+collects numerator in every row it hits, while a miss costs only
+$0.5$ in the denominator; the marginal value of hitting one more annotator
+row is $\IoU - 0.5 > 0$, so the \emph{per-image optimal single prediction
+is the consensus shape} across annotators. Second, the $\IoU>0.5$ cliff is
+brutal on instance boundaries: merging two filaments into one connected
+component pushes both IoUs below the cliff (both become FN\,+\,FP), and
+shattering one filament has the same effect. Measured on the same
+predictions, lowering the hit threshold from $0.5$ to $0.45$ alone raises
+the pooled PQ of the 1024$^2$ model from $0.315$ to $0.343$: roughly
+$0.09$ PQ of the 1024$^2$ line sits directly on the cliff
+(``overlapped but not overlapped \emph{well} enough'').
+
+\section{Data}
+\label{sec:data}
+
+All data come from the public Kaggle competition package
+\texttt{filament-segmentation-2026} (\texttt{kaggle competitions download
+-c filament-segmentation-2026}, $\approx$716\,MB, 888 files):
+\begin{itemize}
+\item \texttt{MAGFiLO\_1.0\_Kaggle\_2026/train/\\
+      MAGFiLO\_1.0\_Annotations\_kaggle2026\_train.json} --- COCO-style
+      annotations \cite{magfilo}: 1{,}154 image entries
+      $=$ 1{,}154 unique (annotator prefix, file\_name) pairs over
+      \textbf{707} physical images by \textbf{37} annotators
+      (1 annotator: 411 images, 2: 145, 3: 151); \textbf{8{,}199} polygon
+      instances in 4 classes (Left 2{,}535 / Right 2{,}590 /
+      Unidentifiable 3{,}074 / Ambiguous 0 --- the class exists in the
+      vocabulary but has zero instances in this batch); every image is
+      $2048\times2048$, every annotation a single polygon;
+\item \texttt{MAGFiLO\_1.0\_Kaggle\_2026/train/train\_images/} ---
+      707 JPEGs;
+\item \texttt{MAGFiLO\_1.0\_Kaggle\_2026/test/test\_images/} ---
+      180 JPEGs, no labels.
+\end{itemize}
+The competition's terms allow non-commercial academic research use of the
+data and forbid redistribution, which is why this repository ships code
+only (enforced by \texttt{check\_repo.py}).
+
+\section{Method}
+\label{sec:method}
+
+\subsection{Consensus pseudo-labels (\texttt{build\_pixel\_labels.py})}
+All annotators of one physical image are rasterized onto one
+$2048^2$ canvas with pycocotools (official semantics), then voted
+per pixel:
+$\mathrm{support}[p]$ = number of annotators whose instance union covers
+$p$; $\mathrm{votes}[c][p]$ = number of annotators covering $p$ with class
+$c$ (one vote per annotator per class); $\mathrm{class}[p] =
+\arg\max_c \mathrm{votes}[c]+1$ with background $0$ and ties broken by the
+fixed channel order Left\,$>$\,Right\,$>$\,Unidentifiable\,$>$\,Ambiguous.
+The builder also emits per-annotator row masks used by the evaluator, plus
+$512^2$ area-averaged views. A verification pass re-reads every artifact
+and cross-checks the support map of all 296 multi-annotator images
+pixel-by-pixel against an independent probe implementation
+(\texttt{annot\_consensus\_probe2.py}). Aggregate vote statistics of the
+full build: 851{,}542 tie pixels at $2048^2$; only 10 pixels where a
+single annotator drew two classes on the same pixel; 3{,}459{,}165 pixels
+with support\,$\ge 2$.
+
+Note the counting convention: ``8{,}199 instances'' is the
+\emph{annotator-level} polygon count. After consensus, the foreground of
+the class map decomposes into 5{,}578 connected components
+(2{,}041 with support\,$\ge2$) --- the consensus label teaches
+\emph{semantic} foreground, not 8{,}199 individual filaments.
+
+\subsection{A fixed validation split (\texttt{make\_val\_split.py})}
+The validation set is drawn \emph{only} from public training annotations:
+candidates are multi-annotator ($\ge2$) images, stratified by
+(era $=$ first 4 characters of the file name, annotator count), shuffled
+deterministically with seed 20261031 inside each stratum, taking
+$\lceil \tfrac13 |\text{stratum}|\rceil$ per stratum. Run today on the
+complete public data this yields \textbf{val\,=\,106 / train\,=\,601}
+(sha256 of the val list \texttt{0dc83e49\dots}). The historical numbers in
+Section~\ref{sec:exp} were measured on the \emph{frozen} val-88 produced
+by the same script at a time when only 558 of the 707 images were on disk;
+that list (sha256 \texttt{5a894bec\dots}) is not part of the public data,
+so readers reproducing the pipeline get val-106, and absolute PQ values
+may shift slightly while relative comparisons transfer.
+
+\subsection{Network and training (\texttt{unet\_train\_crop.py})}
+A U-Net with double-conv blocks, base width 32, depth 5
+(7{,}759{,}653 parameters), two heads: a support head (sigmoid) and a
+4-class head (softmax over Left/Right/Unidentifiable/Ambiguous, background
+ignored). Inputs are $1024^2$ crops: the image is decoded
+$2048^2\!\to\!1024^2$ with PIL bilinear; the label's support map is
+area-averaged to $1024^2$ and normalized to $t\in[0,1]$ by its per-image
+maximum. Loss $=\mathrm{BCE}_w + 0.5\,\mathrm{CE}$ with soft positive
+weight $w = 1 + 9t$; Adam, lr $10^{-3}$ with cosine annealing, batch 4,
+50 epochs, fp16 autocast + GradScaler. A seeds study kept base 32
+(a base-48 variant was \emph{worse}: PQ 0.2096 vs.\ 0.2966 for a same-family
+seed, at $2.25\times$ parameters). Wall clock on a Tesla V100S-32GB:
+$\approx$29--30\,min per seed; peak allocation 18.99\,GiB, hence the local
+8\,GB smoke test in the README uses batch 1.
+
+\subsection{Inference and TTA (\texttt{unet\_infer1024.py})}
+Each image is decoded exactly as in training, forwarded once (and once
+more flipped for TTA); probabilities of the flipped pass are flipped back
+and averaged. hflip TTA was the only ensemble component that reliably
+helped (Section~\ref{sec:exp}). Probability caches are stored per image as
+\texttt{prob1024} (float16) and \texttt{cls1024} (uint8) \texttt{.npz}.
+
+\subsection{From probability map to instances
+(\texttt{postproc\_sweep.py}, \texttt{unet\_infer.py})}
+\[
+  \text{prob} \xrightarrow{\;\text{bilinear}\;} 2048^2
+  \;\to\; \text{threshold } \theta
+  \;\to\; [\text{morph. open/close } k\!\times\!k]
+  \;\to\; \text{4-connected components}
+  \;\to\; \text{area floor } a
+  \;\to\; [\text{graded fallback}]
+\]
+The fallback re-extracts with relaxed settings
+($\theta{=}0.55, a{=}200$) $\to$ ($\theta{=}0.45, a{=}0$) $\to$
+($\theta{=}0.9\max$, largest component only) whenever the primary
+configuration yields nothing, because an empty prediction forfeits
+\emph{all} rows of that image to FN. In production, 173 of 180 test
+images needed no fallback and 7 used the first relaxed level
+(512$^2$ line); the graded chain is measured to cost
+$+0.001$ PQ over no-fallback on val.
+
+\subsection{Ensembling and the final submission}
+The final submission averages the probability caches of four seeds
+(s3, s5, s11, s12; all with hvflip TTA) and extracts with closing
+$k{=}7$, $\theta{=}0.70$, $a{=}600$
+(\texttt{postproc\_sweep.py submit --preset close7\_t070\_a600}).
+RLE encoding, the two-column CSV contract
+(\texttt{filament\_id,segmentation\_rle}, COCO compressed RLE,
+$2048\times2048$ fixed size, no quotes) and a pre-submission validator
+are in \texttt{rle.py}/\texttt{submit\_writer.py}; the encoder is a pure
+Python re-implementation of pycocotools' \texttt{rleToString}/
+\texttt{rleFrString} and was cross-checked against \texttt{pycocotools}.
+
+\section{Experiments}
+\label{sec:exp}
+
+\subsection{Official-metric results on the frozen val-88}
+Same split, same ground-truth rows (220 rows / 1{,}514 masks / 21
+annotators), same evaluator (\texttt{solar\_eval\_local.py}, which agrees
+with the official replica to $\Delta=0$ on every field):
+
+\begin{table}[h]
+\centering
+\caption{Validation-88 results, official pooled PQ and pooled Dice.}
+\begin{tabular}{lccc}
+\toprule
+System & PQ & Dice & TP/FP/FN\\
+\midrule
+v3 hand-crafted detector              & 0.220085 & 0.486084 & 455/698/1059\\
+512$^2$ U-Net (base16/depth4)         & 0.269595 & 0.621649 & 603/636/911\\
+1024$^2$ s3 + hvflip TTA, thr.70/a600 & 0.315167 & 0.640948 & 704/637/810\\
+\quad + closing $k{=}3$ (``close3'')  & 0.317162 & 0.641168 & 708/628/806\\
+best single seed s12 (thr.70/a700)    & \textbf{0.326789} & 0.643550 & 714/630/800\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Against v3, the 1024$^2$ line gains $+0.0951$ PQ and $+0.1549$ Dice. The
+gain decomposes into mostly recall (FN $-249$) rather than precision.
+
+\subsection{Ablations (negative results included)}
+On the same probability caches and evaluator:
+\begin{itemize}
+\item \textbf{Per-class instance splitting hurts}: thresholding
+      Left/Right/Unidentifiable separately shatters filaments;
+      PQ $0.3142\to0.2917$ ($-0.0224$). Geometric watershed splitting is
+      catastrophic: $-0.2019$.
+\item \textbf{Morphological closing helps, opening hurts}
+      (60-variant sweep): close $k\in\{3,5,9,13\}$ are the top-4 variants
+      (0.31716/0.31617/0.31696/0.31651 vs.\ baseline 0.31517); open3 drops
+      to 0.31212, open13 to 0.10242.
+\item \textbf{TTA helps; seed averaging does not}: hflip TTA
+      $+0.0203$; every multi-seed probability average lost to the best
+      member (e.g.\ s2+s3: $-0.0157$; 4-seed: $-0.0497$). The final
+      submission nevertheless used a 4-seed average for robustness on
+      test, a choice that could not be validated online
+      (Section~\ref{sec:lb}).
+\item \textbf{Per-image adaptive thresholds and probability calibration
+      all failed} (best calibration variant $-0.0024$; adaptive family
+      worst $0.0042$).
+\end{itemize}
+
+\subsection{Training stability}
+Out of 15 training runs with the fp16 recipe, 6 diverged to NaN loss
+(seeds 7, 9, 10, 13, 14, 15; first NaN between epoch 5 and 22) and were
+terminated; a re-run of seed 7 with a different GPU trajectory completed
+but stayed weak (PQ 0.1845), i.e.\ seed 7 is a genuinely bad seed, not
+only a diverging one. This is reported as-is; the released recipe has no
+NaN guard beyond what is documented.
+
+\subsection{Public leaderboard}
+\label{sec:lb}
+Only the \emph{hand-crafted detector line} was ever submitted to Kaggle
+(all UNet-line ``submissions'' on disk are candidates that passed format
+gates but were never scored): threshold baseline \textbf{0.15} (ref
+57758939, 126/180 test images covered), consensus detector \textbf{0.16},
+full-coverage re-submit \textbf{0.17}, multi-era re-tuned v3 \textbf{0.18}
+(ref 57769686, rank \#1117/1261). Leaderboard anchors at the time:
+$0.70\to$\,\#1, $0.39\to$\,\#164, $0.30\to$\,\#893, $0.20\to$\,\#1096.
+Local val numbers must not be read as expected online scores: the
+organizer's own metadata names \texttt{panoptic\_quality} while the page
+mentions ``mean Dice'', the snapshot has no per-metric columns, and the
+local$\to$online conversion of the detector line was systematically lossy
+(local $+26.6\%$ pooled became $0.15\to0.16$ online).
+
+\subsection{Selection optimism}
+The val-88 set served as monitoring set, checkpoint selector, 40-point
+thr$\times$min-area grid per seed, 60-variant post-processing sweep, and
+seed selector. A quantitative half-split audit (choose on one half, score
+on the other) puts the post-processing selection optimism at
+$+0.002$--$+0.015$ PQ depending on the split; the closing step itself is
+consistent across all five splits tried ($+0.0005$--$+0.0033$), while the
+specific champion (close3, $+0.0002$ over close9) is not reproducible as
+rank~1 in any half. Seed-level selection was stable (s12 first in both
+halves, optimism $\le10^{-5}$). Treat $0.3279$ as a development-set
+number, discounted by that margin.
+
+\section{What was re-run while building this repository}
+\label{sec:repro}
+
+The original workspace's training/inference/sweep scripts ran partly on a
+remote V100S host whose copies of \texttt{unet\_infer1024.py} and
+\texttt{postproc\_sweep.py} were not snapshotted. This repository contains
+faithful reconstructions of both, written against their documented
+on-disk contracts, and validated against the frozen artifacts:
+
+\begin{table}[h]
+\centering
+\caption{Reconstruction audit: re-running the reconstructed
+\texttt{postproc\_sweep.py} on the frozen s3+TTA validation probability
+cache (88 images) versus the numbers recorded when the sweep originally
+ran (\texttt{postproc\_sweep\_val88.csv}).}
+\begin{tabular}{lccc}
+\toprule
+Variant & recorded PQ & this repo & exact\\
+\midrule
+baseline thr.70/a600, relax chain & 0.31516699298930984 & 0.31516699298930984 & \checkmark\\
+no-relax (allow empty)            & 0.31416930530119935 & 0.31416930530119935 & \checkmark\\
+relax1-only                       & 0.31516699298930984 & 0.31516699298930984 & \checkmark\\
+close3                            & 0.3171617809448947  & 0.3171617809448947  & \checkmark\\
+close5 / close9 / close13         & 0.31617 / 0.31696 / 0.31651 & same & \checkmark\\
+open3 / open5                     & 0.312117 / 0.304031 & same & \checkmark\\
+open9 / open13 (rejected tails)   & 0.214764 / 0.102424 & 0.213390 / 0.100065 & $\approx$\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The two residual deltas sit on the two \emph{rejected} opening variants
+with near-empty primary masks (large-opening border semantics); no
+decision of the original pipeline depended on them. Two semantics choices
+were pinned by this audit and are documented in the code: morphological
+operations use scipy's default border handling (no padding), and the
+graded fallback is pure re-thresholding (morphology applies at the primary
+level only).
+
+The README's command chain was additionally executed end-to-end on this
+machine (full consensus build on all 707 images, fresh val-106 split,
+2-epoch training smoke on an RTX 3070 Laptop, inference on
+val\,+\,test, submission generation with the close7 preset, hard-gate
+validation, and official-metric evaluation); see README \S5 for the
+transcript and expected artifacts.
+
+\section{Limitations}
+\begin{itemize}
+\item No online score exists for the UNet line; PQ--Dice mixing on the
+      public board is unresolved.
+\item The model predicts semantic foreground; its $\approx6$ instances per
+      image versus the GT median 15.5 per image indicates the
+      Left/Right ``two halves of one loop'' granularity is not recovered,
+      and $\approx23\%$ of GT sits in the $0.2<\IoU\le0.5$ band
+      (boundary precision, the main remaining loss source).
+\item fp16 divergence in 6/15 seeds is unresolved; the released recipe
+      documents it instead of fixing it.
+\item Val-88 doubled as the selection set; the honest generalization
+      discount is $+0.002$--$+0.015$ PQ.
+\end{itemize}
+
+\begin{thebibliography}{9}
+
+\bibitem{magfilo}
+A. Ahmadzadeh, R. Adhyapak, K. Chaurasiya, et al.
+\emph{A dataset of manually annotated filaments from H-alpha observations}.
+Scientific Data 11, 1031 (2024).
+\url{https://doi.org/10.1038/s41597-024-03876-y}
+(MAGFiLO v1.0; the competition package is its Kaggle 2026 extract).
+
+\bibitem{competition}
+IEEE BigData Cup 2026, Kaggle competition
+\texttt{filament-segmentation-2026}.
+\url{https://www.kaggle.com/competitions/filament-segmentation-2026}
+
+\bibitem{notebook}
+A. Ahmadzadeh. \emph{Self-evaluation notebook} (official PQ definition).
+\url{https://www.kaggle.com/code/azimahmadzadeh/self-evaluation-notebook}
+
+\bibitem{kirillov2019}
+A. Kirillov, K. He, R. Girshick, J. Deng, P. Doll\'ar.
+\emph{Panoptic Segmentation}. CVPR 2019 (Panoptic Quality).
+
+\bibitem{pycocotools}
+pycocotools COCO API (RLE encoding semantics).
+\url{https://github.com/ppwwyyxx/cocoapi}
+
+\end{thebibliography}
+
+\end{document}

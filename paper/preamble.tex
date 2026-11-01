@@ -1,0 +1,49 @@
+% preamble.tex -- shared packages and macros for the Solar Filament report.
+% Included by main.tex; kept separate so that the document body can be edited
+% without touching the package setup.
+
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{seqsplit}
+
+% This TeX Live installation has no libertine / newtxmath / inconsolata, so
+% acmart falls back to non-scalable Type 3 fonts in the front-matter blocks.
+% microtype's automatic font expansion then fails on those blocks, so the
+% expansion is switched off (the fallback fonts are used for the whole
+% document anyway).
+\microtypesetup{expansion=false}
+
+% acmart puts \shorttitle in the running head but this class version does not
+% define the macro, so it is defined here (no argument) to keep the header
+% from overflowing into the conference name.
+\def\shorttitle{Solar Filament Segmentation}
+
+% Small helper: a number printed with a fixed number of decimals.
+\newcommand{\num}[2]{\ensuremath{#1#2}}
+
+% Compact "delta" column with an explicit sign.
+\newcommand{\dlt}[1]{\ensuremath{\Delta\mathrm{PQ} = #1}}
+
+% Keep floats inside their column where possible and avoid float-induced
+% overflow of the two-column layout.
+\setlength{\textfloatsep}{10pt plus 2pt minus 2pt}
+\setlength{\floatsep}{8pt plus 2pt minus 2pt}
+\setlength{\abovecaptionskip}{4pt}
+\setlength{\belowcaptionskip}{2pt}
+
+% Give the justifier a little extra room, so that long numbers and inline
+% formulas do not push lines out of the column.
+\setlength{\emergencystretch}{1.5em}
+
+% Breakable typewriter text for artifact file names (they are long and must
+% not overflow the two-column measure).
+\newcommand{\fn}[1]{\texttt{\seqsplit{#1}}}
+
+% Data-availability note used in the reproducibility paragraph.
+\newcommand{\artifacts}{All validation numbers quoted here were produced by the
+retained evaluation artifacts of the project (per-variant evaluation JSONs,
+the seed table, the post-processing and ensemble sweep tables, and the
+captured public-leaderboard listing); each claim in this paper is traceable to
+one of those files.}

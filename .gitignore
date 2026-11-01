@@ -1,0 +1,75 @@
+# Solar Filament 公开仓库 —— .gitignore
+#
+# 口径：**比赛数据一律不入库；模型权重必须入库**。
+#   - 禁入：训练图 / 测试图 / 标注 JSON / 预测 CSV / 概率缓存 npz / 训练日志
+#            （官方条款：数据仅限非商业学术研究使用、不得再分发）
+#   - 入库：weights/ 下的 .pt 权重、paper/ 下的报告源与 PDF、全部 .py / .tex / .md
+#     （官方要求：权重必须存在仓库里，并在 notebook 中被直接加载，无需重训）
+# 下面的规则与仓库内的 `check_repo.py` 卫生闸基本同口径；唯一差别：check_repo.py 更严，
+# 只放行 weights/ 白名单里的 4 个 .pt（其余位置的 .pt 一律禁），而这里为了「不把权重
+# 意外挡掉」，全局不忽略 *.pt —— 多出来的 .pt 请自己确认不是数据衍生物再提交。
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.venv/
+venv/
+.env
+
+# ---------- 工作目录与数据产物（本仓库不放比赛数据） ----------
+data/
+datasets/
+labels/
+cache/
+out/
+prob_*/
+*.npz
+*.npy
+*.csv
+*.jpeg
+*.jpg
+*.pkl
+*.parquet
+*.zip
+*.gz
+*.7z
+*.rar
+val_split.json
+build_manifest.json
+consensus_index.json
+gt_index.json
+
+# ---------- 日志 ----------
+*.log
+
+# ---------- LaTeX 编译中间产物（paper/ 的 .tex/.bib/.pdf 仍入库） ----------
+*.aux
+*.bbl
+*.blg
+*.out
+*.toc
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.nav
+*.snm
+*.vrb
+
+# ---------- 系统 ----------
+.DS_Store
+Thumbs.db
+
+# ---------- 明确入库：模型权重 ----------
+# 官方要求权重入库 + notebook 直接加载，因此这里**故意不忽略** *.pt / *.pth。
+# 下面两行是显式放行，防止日后有人加了全局 `*.pt` 规则把权重悄悄挡掉。
+!weights/
+!weights/*.pt
+!weights/*.pth

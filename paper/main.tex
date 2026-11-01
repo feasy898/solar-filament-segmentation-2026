@@ -1,0 +1,339 @@
+% =====================================================================
+%  Solar Filament Segmentation (IEEE BigData Cup 2026) -- team report
+%  Build:  pdflatex main.tex ; bibtex main ; pdflatex main.tex ; pdflatex main.tex
+%  Length budget: 4 pages (ACM acmart / sigconf).
+% =====================================================================
+\documentclass[sigconf]{acmart}
+
+\input{preamble}
+
+\acmConference[Solar Filament Segmentation Challenge 2026]{IEEE BigData Cup 2026}{November 2026}{Online}
+\settopmatter{printacmref=false} % libertine/newtxmath are not installed in this TeX Live,
+                                 % so the ACM reference-format block cannot be typeset
+\renewcommand\footnotetextcopyrightpermission[1]{} % no copyright block in this template
+
+\title{Consensus Pseudo-Labels for Solar\\
+Filament Instance Segmentation}
+
+\author{Team feasylol}
+
+\keywords{instance segmentation, solar filaments, consensus pseudo-labels,
+U-Net, panoptic quality, sunspot and filament analysis}
+\ccsdesc[500]{Computing methodologies~Image processing}
+\ccsdesc[300]{Applied computing~Astronomy}
+
+\begin{document}
+
+\begin{abstract}
+Solar filaments are thin, low-contrast dark structures in full-disk solar
+images; the challenge asks for them as \emph{instances}, not as a foreground
+mask. The organiser's metric is a row-wise panoptic-quality (PQ) score: every
+annotator--image row of the ground truth is scored against the same predicted
+instances, so a prediction must agree with the annotators simultaneously,
+rather than with one of them. We first attacked the task with a
+hand-crafted consensus detector, then replaced it by learning. Our pipeline
+turns the public multi-annotator polygons into per-pixel consensus
+pseudo-labels (a support count plus a per-class vote), trains a
+7.76M-parameter U-Net on 1024$\times$1024 maps, extracts instances by
+thresholding, a $7\times7$ morphological closing, 4-connectivity labelling and
+an area floor with a per-image relaxation fallback, and averages four seeds
+with horizontal-flip test-time augmentation. On a
+fixed 88-image validation split (220 annotator--image rows, 1{,}514
+ground-truth masks, 21 annotators) the local replication of the official score
+rises from 0.2201 to 0.3449, and the public-leaderboard score from 0.18 to
+0.29. We also report negative results (class splitting, geometric watershed, a
+wider network) and the optimism ($\approx 0.015$ PQ) of using one shared
+validation split for monitoring, thresholding and seed selection.
+\end{abstract}
+
+\maketitle
+
+\section{Introduction}
+Filaments are magnetic features that appear as dark, elongated structures on
+the solar disk. Segmenting them is hard for two independent reasons: they are
+weakly contrasted against the photosphere, and different human annotators
+trace the same filament differently. The Solar Filament Segmentation Challenge
+of the IEEE BigData Cup 2026 provides 1{,}154 annotator--image annotation
+entries over 707 distinct full-disk images (8{,}199 single-polygon instances,
+four category labels: Left, Right, Unidentifiable and Ambiguous), while the 180
+test images ship without public annotations. Annotator disagreement is
+therefore part of the task definition, not noise around it.
+
+The metric makes this explicit. The organiser scores each
+\emph{annotator--image} row separately and pools the rows: a prediction is a
+true positive if it overlaps a ground-truth instance of that row with IoU
+strictly above 0.5, matched pairs are counted (not unique matches), and the
+score is $\sum\mathrm{IoU}(\mathrm{TP})/(|TP|+0.5|FP|+0.5|FN|)$~\cite{notebook}.
+A prediction that satisfies only one
+annotator is a true positive in that row and a false positive in every other
+row, so the metric rewards shapes that several annotators agree on --- the
+design principle of our second system.
+
+Our first system was a hand-crafted detector that fused several pseudo-annotator
+scales into an instance-anchored consensus and thresholded a local-contrast
+image; it reached a local PQ of 0.2201 and a public score of 0.18. Its ceiling
+was obvious: every improvement came from re-tuning hand-made thresholds. All
+comparisons below are between our own variants, measured with one protocol on
+one split; we make no claim about methods we did not run.
+
+We contribute: (i) a consensus pseudo-label construction that is derived from
+the public polygons only, together with the measurement that motivates it
+(Section~\ref{sec:consensus}); (ii) a U-Net recipe and an instance-extraction
+pipeline with a relaxation fallback (Section~\ref{sec:method}); (iii) an
+evaluation protocol that keeps the validation images out of training and
+quantifies the selection optimism that this shared split introduces
+(Section~\ref{sec:eval}); and
+(iv) an ablation table that reports the variants that failed
+(Section~\ref{sec:ablation}).
+
+\section{Methodology}
+\label{sec:method}
+
+\subsection{Consensus pseudo-labels}
+\label{sec:consensus}
+The public training polygons are the only supervision available. We rasterised
+every annotator's polygons onto the native $2048\times2048$ canvas with the
+official COCO routine (polygon-to-mask followed by mask merging) and built
+three per-pixel maps per image:
+\emph{support} (how many annotators' instances cover the pixel, $0..M$ where
+$M$ is the number of annotators of that image), \emph{votes} (four channels,
+one per category, counting the annotators covering the pixel with that
+category) and \emph{class} (the arg-max of the votes, ties broken in the fixed
+order Left $>$ Right $>$ Unidentifiable $>$ Ambiguous). The maps are built at
+the native $2048\times2048$ resolution and, for the $1024\times1024$ models,
+area-averaged in $k\times k$ blocks with $k=2048/1024=2$; the soft target is
+that average over its per-image maximum, the class map its arg-max over the
+four channels. The image is resized $2048^2\to1024^2$ bilinearly, so one
+example is a whole disk, not a sub-crop. The label files also carry a
+$512\times512$ view ($4\times4$ block mean of support, block sum of votes)
+that the earlier $512$-pixel model consumed and the $1024$-pixel training code
+never reads. The category statistics of this
+release are Left 2{,}535, Right 2{,}590, Unidentifiable 3{,}074 and Ambiguous
+0 instances; the Ambiguous channel is kept but is empty, and 3{,}459{,}165
+pixels are covered by two or more annotators.
+
+Why a consensus instead of a single annotator? The annotations genuinely
+disagree: over 3{,}152 greedily matched instance pairs the median IoU is
+0.5762 and only 68\% of the pairs exceed IoU 0.5. We therefore measured
+detectors that copy one annotator against detectors that vote, grouping the
+rows by the number of annotators per image. On two-annotator images, copying an
+annotator gives PQ 0.6802 and 0.6794, whereas the support $\geq 2$ vote gives
+0.7090. On three-annotator images the copy baseline averages 0.5556 and the
+same vote reaches 0.6248. Leave-one-out over the 151 three-annotator images
+confirms the direction (0.3462 for the union rule against 0.3334 for copying
+one annotator). The consensus is therefore not a smoothing heuristic: scored
+against all annotators at once it is closer to them collectively than any
+single annotation, which is what the row-wise metric rewards.
+
+\subsection{Network and training}
+We train a five-level U-Net with 32 base channels (7{,}759{,}653 parameters) on
+the $1024\times1024$ consensus maps, with random flips and intensity jitter.
+The optimiser is Adam with a
+learning rate of $10^{-3}$ on a cosine schedule, mixed precision, batch size 4
+and 50 epochs; the loss is a soft binary cross-entropy on the support map plus
+$0.5\times$ cross-entropy on the class map. A base-32 run takes 28.95--30.16 minutes
+on a single Tesla V100S (155 optimiser steps per epoch). We ran 15 such runs
+over 13 distinct seeds (the two diverged seeds 7 and 15 were re-run); 6 of
+them diverged with a non-finite loss and are reported as such rather than
+silently dropped.
+
+\subsection{Instance extraction}
+At inference the $1024\times1024$ probability map is bilinearly upsampled to
+the native $2048\times2048$ canvas, on which every step below acts: the map is
+thresholded at 0.70, closed with a
+$7\times7$ morphological kernel, labelled with 4-connectivity, and components
+smaller than 600 pixels are discarded. Because an empty prediction for an image
+is catastrophic under a row-wise metric, an image that would end up empty is
+re-processed along a relaxation chain (threshold 0.55 with area floor 200,
+then threshold 0.45, then the largest component alone), so that no test image
+is left without an instance. On the submitted ensemble, 5 of the 180 test
+images needed that fallback and the produced file passed the submission
+contract check with zero issues.
+
+\subsection{Ensembling}
+Four independently trained seeds (three with the same recipe but different
+seeds, plus the seed used for the single-model submission) are averaged in
+probability space, each with horizontal-flip test-time augmentation, and
+post-processed exactly as above.
+
+\section{Evaluation}
+\label{sec:eval}
+
+\subsection{Protocol}
+All local numbers use a local replication of the organiser's self-evaluation
+notebook~\cite{notebook}: IoU$>0.5$ strictly, matched pairs counted, numerators
+accumulating the IoU of the matched pairs, pooled over all
+annotator--image rows; we also report the pooled pixel Dice.
+
+The split is fixed for every experiment. Of the 707 training images, 296 carry
+at least two annotators; 88 of them form the validation set (stratified by era
+and by annotator count, shuffled with a fixed seed), and the remaining 619
+images are the training set. The two sets are disjoint (0 shared file names).
+The validation set contains 220 annotator--image rows, 1{,}514 ground-truth
+masks and 21 annotators. The models are trained on the 619 images only; the 88
+validation images are never trained on, but they are used for checkpoint
+selection and for every hyper-parameter scan below, which we quantify in
+Section~\ref{sec:limits}.
+
+\subsection{Main results}
+Table~\ref{tab:main} lists the progression of our own systems under one
+protocol. The hand-crafted consensus detector reaches PQ 0.2201 and Dice
+0.4861. Learning from consensus pseudo-labels gives 0.2696 / 0.6216 with a
+512-pixel model; a 1024-pixel model with flip TTA gives 0.3152 / 0.6409.
+Averaging four seeds adds $+0.0218$ PQ (0.3370 / 0.6512) and the
+morphological closing a further $+0.0079$ (0.3449 / 0.6547), with 554
+predicted instances over the 88 images. The 512-pixel row is an earlier and
+much smaller model (0.48M parameters, 90 epochs, 14.5 minutes on an RTX 3070
+laptop GPU) whose training log records 473 training and 85 validation images:
+at that time 558 of the 707 training images had been downloaded, so it saw
+473 images against the 619 used by the 1024-pixel models; the step to 1024
+pixels therefore changes resolution, capacity, schedule and data size together
+and is not an ablation of resolution alone.
+
+\begin{table}[t]
+\footnotesize
+\setlength{\tabcolsep}{3.6pt}
+\caption{Validation results on the fixed 88-image split, using the local
+replication of the official metric (PQ pooled over annotator--image rows, Dice
+pooled over pixels; TP/FP/FN in the official convention). TTA = horizontal-flip
+test-time augmentation.}
+\label{tab:main}
+\begin{tabular}{lrrrrr}
+\toprule
+System & PQ & Dice & TP & FP & FN \\
+\midrule
+Hand-crafted detector & 0.2201 & 0.4861 & 455 & 698 & 1{,}059 \\
+U-Net, 512 px & 0.2696 & 0.6216 & 603 & 636 & 911 \\
+U-Net, 1024 px + TTA & 0.3152 & 0.6409 & 704 & 637 & 810 \\
+4-seed probability average & 0.3370 & 0.6512 & 758 & 654 & 756 \\
+\quad + $7\times7$ closing (submitted) & \textbf{0.3449} & \textbf{0.6547} & 779 & 632 & 735 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Ablations, including the negative ones}
+\label{sec:ablation}
+Table~\ref{tab:abl} summarises the variants we tested. Three of them are
+negative results that we report because they shaped the final design.
+Splitting an instance by its Left/Right class label costs $-0.0224$ PQ
+(0.3142 to 0.2917): the split produces a narrower fragment that misses the
+annotator boundary, and the metric punishes both the new false positive and
+the new false negative. Replacing connected components by a geometric
+watershed is much worse ($-0.2019$, 0.3142 to 0.1123): the watershed
+over-segments the foreground into hundreds of fragments and the false-positive
+count grows from 635 to 1{,}427. Widening the network from 32 to 48 base
+channels also hurts: the base-48 run reaches 0.2096 against 0.2966 for the
+base-32 run of the same family. The two runs differ in seed, so the comparison
+also carries the seed spread quantified below, but this is the only wider
+configuration we trained, and it ends 0.087 PQ behind while costing 2.25$\times$
+the parameters and 48.7 instead of 29.0 minutes per seed, so we abandoned that
+line.
+
+Two further observations qualify the remaining gains. First, the closing kernel
+is not a knife-edge: kernels 7, 9 and 13 give 0.3449, 0.3443 and 0.3441, a
+spread of 0.0008, so the gain comes from closing the gaps rather than from the
+particular kernel size. Second, the seed spread is much larger than the
+ensembling gain: over the four seeds for which we have complete sweeps, the
+best validation PQ ranges from 0.2070 to 0.2905 without flip TTA and from
+0.2231 to 0.3142 with it, i.e. an envelope of 0.2070--0.3142, while the
+four-seed average gains $+0.0218$ over the single-seed system it replaces.
+Seed selection therefore carries a risk that ensembling only partly offsets.
+
+\begin{table}[t]
+\footnotesize
+\setlength{\tabcolsep}{3.2pt}
+\caption{Ablations on the same split, with the same probability maps and
+evaluator; $\Delta$ (in brackets) is the change in PQ with respect to the row it
+is compared against; TTA = horizontal-flip test-time augmentation,
+$k$ = closing kernel.}
+\label{tab:abl}
+\begin{tabular}{lrr}
+\toprule
+Variant & PQ & TP/FP/FN \\
+\midrule
+TTA off (1 seed) & 0.2922 [$-0.0230$] & 689/772/825 \\
+TTA on (1 seed) & 0.3152 & 704/637/810 \\
+Closing $k=3/5/7/9/13$ & 0.3386--0.3449 & --- \\
+Class split (Left/Right) & 0.2917 [$-0.0224$] & 649/669/865 \\
+Watershed (best of 4) & 0.1123 [$-0.2019$] & 286/1{,}427/1{,}228 \\
+Wider net (48 base ch.) & 0.2096 [$-0.0870$] & 494/942/1{,}020 \\
+Best single seed & 0.3268 & --- \\
+4-seed avg., no closing & 0.3370 [$+0.0102$] & 758/654/756 \\
+4-seed avg. + closing & 0.3449 [$+0.0079$] & 779/632/735 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Public leaderboard}
+Eight files have been submitted. Their public scores rise together with our own
+local scores: 0.15 (first hand-crafted file, 126 of 180 test images covered),
+0.16, 0.17 and 0.18 (the hand-crafted consensus detector, 174 of 180 images
+covered), then 0.21 for the 512-pixel U-Net (local validation PQ 0.2696), 0.25
+for a two-seed average (0.2993), 0.27 for the single 1024-pixel seed (0.3152)
+and 0.29 for the submitted four-seed ensemble with closing (0.3449).
+Dividing the public score by the local validation PQ of the same file gives
+0.779, 0.835, 0.857 and 0.841 for
+the four model submissions, i.e. a band of 0.78 to 0.86, which indicates that
+the local protocol ranks our own variants in the same order as the public
+board does.
+We stress two caveats. The public score is a coarse signal, not an estimate of
+our test performance: the API metadata announces a panoptic-quality
+algorithm while the challenge page describes a mean-Dice score, and the
+leaderboard exposes a single score column, so the two can never be reconciled
+from the outside. And the local numbers behind those ratios are themselves
+optimistic, for the reason given next.
+
+\subsection{Reproducibility}
+Every number quoted here is read from a retained evaluation artifact rather than
+transcribed: the per-configuration evaluation files
+(\fn{eval\_*\_val88.json}), the seed table (\fn{seed\_pq\_table.json},
+15 training runs), the post-processing sweep
+(\fn{postproc\_sweep\_val88.csv/.json}, 60 variants), the ensemble sweeps
+(\fn{ens\_specs\_val88.csv}, \fn{custom\_specs\_val88.csv}, 64 and
+28 configurations), the submission reports (\fn{submission\_*\_report.json}),
+the captured public-leaderboard listing (\fn{kaggle\_submissions\_20261101.txt},
+8 submissions) and the training log of the 512-pixel model
+(\fn{train\_v1.log}). The file \fn{report\_evidence.json} maps the evaluation
+numbers quoted here to their source artifact.
+
+\subsection{Limitations}
+\label{sec:limits}
+Four limitations qualify everything above. \emph{(i) Selection optimism.} The
+88 validation images play three roles: they monitor training and pick the
+checkpoint, they select the threshold, the closing kernel and the area floor
+over a 60-variant post-processing scan, and they select the seed. Every
+validation number in this paper is therefore a post-selection maximum. We
+quantified the effect by selecting the best variant on one half of the split
+and evaluating it on the other half: the held-out mean is 0.3019 against
+0.3172 for the best variant chosen on the full split, i.e. an optimism of
+about 0.015 PQ, and the estimate ranges from $+0.002$ to $+0.015$ across four
+different splits of the validation set. The same applies to the headline 0.3449, which was also
+chosen on this split. \emph{(ii) Metric ambiguity.} The official description
+of the leaderboard score is inconsistent between the API metadata and the
+challenge page, so we use the public score only for ordering. \emph{(iii) Seed
+variance.} The spread between the four seeds with complete sweeps
+(0.2070--0.3142) is larger than most of
+the individual improvements we report, and 6 of 15 training runs diverged with
+a non-finite loss, which shows that the optimisation itself is fragile.
+\emph{(iv) Data scale.} The supervision is limited to 707 public training
+images; the 512-pixel model was trained on 473 of them, since only 558 were
+on disk at the time and 85 of those were held out for validation, whereas the
+1024-pixel models used all 619 images of the training split, so the effect of
+the larger label set is not isolated.
+
+\begin{acks}
+We thank the organisers of the IEEE BigData Cup 2026 for the Solar Filament
+Segmentation Challenge and for the public self-evaluation notebook that defines
+the metric~\cite{notebook}. The data are the MLEcoFi 2024 dataset (version 1.0)
+from the MLEcoFi Team (Earth-Space AI Research Lab with the National
+Solar Observatory, Georgia State University), obtained through the Kaggle
+competition files~\cite{competition}; the images originate from the
+NSO/GONG network. We also thank the annotators whose multiple polygon
+drawings per image make the consensus analysis in
+Section~\ref{sec:consensus} possible.
+\end{acks}
+
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{main}
+
+\end{document}

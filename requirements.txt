@@ -1,0 +1,24 @@
+# Solar Filament 公开仓库依赖 —— 锁版本（= reproduce.ipynb 全流程实测通过的环境）
+# 环境：Linux, Python 3.11.6, torch 2.5.1+cu124（CUDA 12.4）；
+#       reproduce.ipynb 全流程（提交 CSV + val-88 PQ）实测 GPU：Tesla V100S-PCIE-32GB。
+#       纯 CPU 也能跑通全流程（推理走 fp32，与 GPU fp16 相比可能有毫级数值差异）。
+#
+# 安装与执行：
+#   pip install -r requirements.txt
+#   python -m ipykernel install --user        # （可选）注册 jupyter 内核
+#   jupyter nbconvert --to notebook --execute reproduce.ipynb
+
+# --- 核心管线（训练 / 推理 / 后处理 / 评测 / 提交生成） ---
+torch==2.5.1
+numpy==2.4.6
+scipy==1.17.1
+pillow==13.0.0
+pycocotools==2.0.11     # 官方语义 polygon→mask 光栅化（solar_eval_local 评测用）
+
+# --- notebook 执行（reproduce.ipynb） ---
+nbconvert==7.17.2
+ipykernel==7.4.0
+nbformat==5.11.1
+
+# 数据下载（可选，用 Kaggle CLI 时才需要）
+# kaggle>=1.6
